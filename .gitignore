@@ -1,0 +1,4 @@
+ignore
+.vscode
+.env
+mini_gpt.ipynb
