@@ -250,5 +250,63 @@ class MiniGPT(nn.Module):
         # start with * parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad} # filter out those thta require grad
+        # create optim grous
+        decay_params = [p for n, p, in param_dict.items() if p.dim() >= 2]
+        no_decay_params = [p for n, p, in param_dict.items() if p.dim() < 2]
         
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0},
+        ]
         
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in no_decay_params)
+        
+        print(f'N of decayed param tensors => {len(decay_params)} with {num_decay_params,} parameters')
+        print(f'N of decayed param tensors => {len(no_decay_params)} with {num_nodecay_params,} parameters')
+        
+        # init AdamW optimizer, 
+        fused_avail = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_avail and device == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        
+        optimizer = torch.optim.AdamW(optim_groups, lr=learn_rate, betas=betas, **extra_args)
+        print(f'Using fused AdamW optimizer: {use_fused}')
+        
+        return optimizer
+    
+    def estimate_mfu(self, backforth_per_step, dt): # estimate model flops utilization
+        
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layers, cfg.k_heads, cfg.embed_dim//cfg.k_heads, cfg.block_size
+         
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_backforth = flops_per_token * T
+        flops_per_iter = flops_per_backforth * backforth_per_step
+        # express flops as ratio with A16 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0/dt)
+        flops_promised = 312e12 # peak flops for A100
+        
+        mfu = flops_achieved / flops_promised # get the ratio
+        
+        return mfu
+    
+    @torch.no_grad
+    def generate(self, idx, max_new_tokens, temperature=1.0,top_k=None):
+        
+        for _ in range(max_new_tokens): # crop the sequence context at block_size if its growing too log 
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            
+            logits, _ = self(idx_cond) # forward pass
+            logits = logits[:, -1, :] / temperature #scale by desired temperature
+            
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1))) # crop the logits to only the top_k options...optionally
+
+            probs = func_nn.softmax(logits, dim=1) # apply softmax for normalized distro
+            next_idx = torch.multinomial(probs, num_samples=1) # sample from the distribution
+            out_idx = torch.cat((idx, next_idx), dim=1)
+        
+        return out_idx
+            
