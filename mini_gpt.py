@@ -146,4 +146,109 @@ class MiniGPT(nn.Module):
         
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.wight, mean=0.0, std=0.02)
-     
+    
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f'cannot forward sequence of len{t}, block size is {self.config.block_size}'
+        position = torch.arange(0, t, dtype=torch.long, device=device)
+        
+        # forward pass for gpt
+        tokenembed = self.transformer.word_te(idx)
+        posembed = self.transformer.word_pe(position)
+        
+        x = self.transformer.drop(tokenembed + posembed)
+        
+        for block in self.transformer.attention_layer:
+            x = block(x)
+            
+        x = self.transformer.layer_norm_f(x)
+        
+        if targets is not None:
+            logits = self.linear_head(x)
+            # calc the loss if given desired targets
+            loss = func_nn.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference optimization to forward only the last position
+            logits = self.linear_head(x[:, [-1], :]) 
+            loss = None
+            
+        return logits, loss 
+    
+    def crop_block_size(self, block_size):
+        # for block size interchange when loading pretrained model
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.transformer.word_pe.weight = nn.Parameter(self.transformer.word_pe.weight[:block_size])
+        for block in self.transformer.attention_layer:
+            if hasattr(block.attention, 'bias'):
+                block.attention.bias = block.attention.bias[:,:,:block_size]
+    
+    @classmethod
+    def from_pretrained(cls, model_type, override_args=None):
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        override_args = override_args or {} # default tp empty
+        assert all(k == 'dropout' for k in override_args)
+        
+        from transformers import GPT2LMHeadModel
+        print(f'Loading weights from pretrained gpt2 => {model_type}')
+        
+        # n_layers, k_heads, and embed_dim 
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        
+        print(f'forcing vocab_size=50257, block_size=1024, bias=True')
+        # the same for gpt model checkpoints
+        config_args['vocab_size'] = 50257
+        config_args['block_size'] = 1024
+        config_args['bias'] = True 
+        
+        # you can override dropout
+        if 'dropout' in override_args:
+            print(f"overriding dropout to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
+            
+        # create initalized gpt model from scratch
+        config = GPTconfig(**config_args)
+        gpt_model = MiniGPT(config)
+        state = gpt_model.state_dict()
+        state_keys = state.keys()
+        state_keys = [k for k in state_keys if not k.endswith('.attention.bias')]
+        
+        # load hf transformers model
+        hf_gpt = GPT2LMHeadModel.from_pretrained(model_type)
+        state_hf = hf_gpt.state_dict()
+        
+        # copy in alignment
+        state_keys_hf = state_hf.keys()
+        state_keys_hf = [k for k in state_keys_hf if not k.endswith('.attention.maskedbias')]
+        state_keys_hf = [k for k in state_keys_hf if not k.endswith('.attention.bias')]
+        
+        transposed = ['attention.attention.weight', 'attention.project.weight', 'mlp.fc.weight', 'mlp.project.weight']
+        # openai chekpoints use a conv1D module 
+        # transpose to vanilla linear weights
+        
+        assert len(state_keys_hf) == len(state_keys), f'mismatch of state keys {len(state_keys_hf)} for hf and {len(state_keys)} for scratch'
+        for k in state_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # solution for conv1d weights
+                assert state_hf[k].shape[::-1] == state[k].shape
+                with torch.no_grad():
+                    state[k].copy(state_hf[k].t())
+            else:
+                assert state_hf[k].shape == state[k].shape
+                with torch.no_grad():
+                    state[k].copy_(state_hf[k])
+                    
+        return gpt_model
+    
+    def configure_optimizers(self, weight_decay, learn_rate, betas, device):
+        # start with * parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad} # filter out those thta require grad
+        
+        
