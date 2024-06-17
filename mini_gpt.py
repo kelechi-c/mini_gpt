@@ -1,8 +1,9 @@
+from turtle import st
 import torch
 import math, dataclasses, inspect, rich, os 
 import torch.nn as nn 
 import torch.nn.functional as func_nn 
-
+from dataclasses import dataclass 
 class LayerNorm(nn.Module): # Layer normalization 
     def __init__(self, k_dims, bias):
         super().__init__()
@@ -68,3 +69,81 @@ class MultiLP(nn.Module):
     
     def __init__(self, config):
         super().__init__()
+        self.fc = nn.Linear(config.embed_dim, 4*config.embed_dim, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.project = nn.Linear(4*config.embed_dim, config.embed_dim, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, input):
+        x = self.gelu(self.fc(input))
+        output = self.dropout(self.project(x))
+        
+        return output 
+    
+class Block(nn.Module):
+    def __init__(self, config):
+        self.layer_norm_1 = LayerNorm(config.embed_dim, bias=config.bias)
+        self.attention = SelfAttention(config)
+        self.layer_norm_2 = LayerNorm(config.embed_dim, bias=config.bias)
+        self.mlp = MultiLP(config)
+        
+    def forward(self, input):
+        input = input + self.attention(self.layer_norm_1(input))
+        output = input + self.mlp(self.layer_norm_2(input))
+        
+        return output
+    
+
+@dataclass
+class GPTconfig:
+    block_size = 1024
+    vocab_size = 50304
+    n_layers = 12
+    k_heads = 12
+    embed_dim = 768
+    dropout = 0.0
+    bias = True
+    
+class MiniGPT(nn.Module):
+    def __init__(self, config: GPTconfig):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
+        
+        self.transformer = nn.ModuleDict(dict(
+            word_te = nn.Embedding(config.vocab_size, config.embed_dim),
+            word_pe = nn.Embedding(config.block_size, config.embed_dim),
+            drop = nn.Dropout(config.dropout),
+            attention_layer = nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
+            layer_norm_f = LayerNorm(config.embed_dim, bias=config.bias)     
+        )) 
+        
+        self.linear_head = nn.Linear(config.embed_dim, config.vocab_size, bias=config.bias)
+        self.transformer.word_te.weight = self.linear_head.weight
+        
+        self.apply(self._init_weights) # init weights for model
+        
+        for pn, p in self.named_parameters():
+            if pn.endswith('project.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.002/math.sqrt(2 * config.n_layers))
+                
+        # display number of parameters in model
+        print(f'number of parameters => {self.get_num_params()/1e6:.2f}')
+        
+    def get_num_params(self, non_embedding=True): #returns the number of parameters in the model
+        num_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            num_params -= self.transformer.word_pe.weight.numel()
+        
+        return num_params
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.wight, mean=0.0, std=0.02)
+     
