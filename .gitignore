@@ -2,4 +2,3 @@ ignore
 .vscode
 .env
 mini_gpt.ipynb
-data_scripts
