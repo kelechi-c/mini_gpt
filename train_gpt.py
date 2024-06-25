@@ -4,6 +4,7 @@ import math
 import pickle
 import numpy as np
 import torch
+from torch import amp, float16, no_grad, zeros
 from torch.nn.parallel import DistributedDataParallel as DDP
 from contextlib import nullcontext
 from torch.distributed import init_process_group, destroy_process_group
@@ -179,3 +180,53 @@ elif init_from == 'resume':
     best_val_loss=checkpoint['best_val_loss']
 
 elif init_from.startswith('gpt2'):
+    print(f'initialize from openai weights {init_from}')
+    override_args=dict(dropout=dropout)
+    model=MiniGPT.from_pretrained(init_from, override_args)
+
+    for k in ['n_layer', 'k_heads', 'embed_dim', 'block_size', 'bias', 'vocab_size']:
+        model_args[k]=getattr(model.config, k)
+
+if block_size < model.config.block_size:
+    model.crop_block_size(block_size)
+    model_args['block_size']=block_size
+
+model.to(device)
+
+# init gradscaler
+scaler=torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+
+# optimizer
+optimizer=model.configure_optimizers(
+    weight_decay, learn_rate, (beta_1, beta_2), device_type)
+
+if init_from == 'resume':
+    optimizer.load_state_dict(checkpoint['optimizers'])
+
+checkpoint=None  # free memory
+
+# compile the model
+if compile:
+    print('compiling the model...')
+    unoptimized_model=model
+    model=torch.compile(model)  # only for nvidia chips and pytorch 2.0
+
+# wrap model into ddp container
+if ddp:
+    model=DDP(model, device_ids=[ddp_local_rank])
+
+@ torch, no_grad()
+def estimate_loss():
+    out={}
+    model.eval()
+        for split in ['train', 'val']:
+            losses=torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                x, y=get_batch(split)
+                with ctx:
+                    logits, loss=model(x, y)
+                losses[k]=loss.item()
+            out[split]=losses.mean()
+    model.train()
+
+    return out
