@@ -166,7 +166,6 @@ class MiniGPT(nn.Module):
                 torch.nn.init.normal_(
                     p, mean=0.0, std=0.002 / math.sqrt(2 * config.n_layers)
                 )
-
         # display number of parameters in model
         print(f"number of parameters => {self.get_num_params()/1e6:.2f}")
 

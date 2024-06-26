@@ -1,4 +1,5 @@
 import os
+import wandb
 import time
 import math
 import pickle
@@ -15,8 +16,9 @@ out_dir = "mini_gpt"
 eval_interval = 200
 log_interval = 1
 eval_only = False
-eval_iters = 200
+eval_iters = 150
 init_from = "scratch"
+save_checkpoint = True
 # wandb
 wandblog = False
 wandb_project = "mini_gpt"
@@ -230,3 +232,65 @@ def estimate_loss():
     model.train()
 
     return out
+
+# learn rate decay
+def get_lr(it):
+    if it < warmup_iters:  # linear warmup
+        return lr * it / warmup_iters
+
+    if it > lr_decay_iters:  # miniumum learn rate
+        return min_lr
+
+    decay_ratio=(it - warmup_iters) / (lr_decay_iters - \
+                 warmup_iters)  # for cosine decay
+    assert 0 <= decay_ratio
+    # coefficient ranges from 0..1
+    coeff=0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+
+    return min_lr + coeff * (lr - min_lr)
+
+# logging function
+wandb.init(project=wandb_project, name=wandb_run, config=config)
+
+# training loop
+x, y=get_batch('train')
+t0=time.time()
+local_iter_run=0
+raw_model=model.module if ddp else model  # unwap ddp container if needed
+running_mfu=-1.0
+
+def training():
+    while True:
+        # setthe learn_rate for this iteration
+        lr=get_lr(iter_num) if decay_lr else lr
+        for param_group in optimizer.param_groups:
+            param_group['lr']=lr
+
+        if iter_num % eval_interval == 0 and master_process:
+            losses=estimate_loss()
+            print(f'step {iter_num}: train_loss {losses['train']:.4f}, val_loss {losses['val']:.4f}')
+            if wandblog:
+                wandb.log({
+                    'iter': iter_num,
+                    'train/loss': losses['train'],
+                    'val/loss': losses['val'],
+                    'lr': lr,
+                    'mfu': running_mfu * 100
+                })
+
+            if losses['val'] < best_val_loss or save_checkpoint:
+                best_val_loss=losses['val']
+                if iter_num > 0:
+                    checkpoint={
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f'saving checkpoint in {out_dir}')
+                    torch.save(checkpoint, os.path.join(
+                        os.getcwd(), out_dir, 'minigpt_ckpt.pt'))
+        if iter_num == 0 and eval_only:
+            break
