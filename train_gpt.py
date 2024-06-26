@@ -1,11 +1,11 @@
 import os
+from torch.autograd import backward
 import wandb
 import time
 import math
 import pickle
 import numpy as np
 import torch
-from torch import amp, float16, no_grad, zeros
 from torch.nn.parallel import DistributedDataParallel as DDP
 from contextlib import nullcontext
 from torch.distributed import init_process_group, destroy_process_group
@@ -22,7 +22,7 @@ save_checkpoint = True
 # wandb
 wandblog = False
 wandb_project = "mini_gpt"
-wandb_run = "research_gpt_1"
+wandb_run = "mini_gpt_1"
 
 # model hparams
 dataset = "openwebtext"
@@ -294,3 +294,39 @@ def training():
                         os.getcwd(), out_dir, 'minigpt_ckpt.pt'))
         if iter_num == 0 and eval_only:
             break
+# backforth update and gradients
+    for micro_step in range(grad_acc_steps):
+        if ddp:
+            model.require_backend_grad_sync=(micro_step == grad_acc_steps - 1)
+
+        with ctx:
+            logits, loss=model(x, y)
+            loss=loss / grad_acc_steps  # scale loss to account for gradient accumulation
+        x, y=get_batch('train')
+        scaler.scale(loss).backward()
+    if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad()  # flush gradients out of memory
+
+    # timing and logging
+    t1=time.time()
+    time_diff1=t1 - t0
+    t0=t1
+
+    if iter_num % log_interval == 0 and master_process:
+        lossf=loss.item() * grad_acc_steps
+        mfu=raw_model.estimate_mfu(batch_size * grad_acc_steps, time_diff1)
+        running_mfu=mfu if running_mfu == 1.0 else 0.9*running_mfu + 0.1*mfu
+
+    print(
+        f'iter {iter_num}: loss {lossf:.af}, time {time_diff1*1000:.2f}ms, mfu > {running_mfu*100:.2f}%')
+
+    # terminate if..
+    if iter_num > max_iters:
+        break
+
+    if ddp:
+        destroy_process_group()
